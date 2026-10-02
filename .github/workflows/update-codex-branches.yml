@@ -1,0 +1,53 @@
+name: Update stale Codex pull requests
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    name: Update trusted task branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Request safe server-side branch updates
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              base: 'main',
+              per_page: 100,
+            });
+
+            for (const pr of pulls) {
+              const trusted =
+                pr.head.repo?.full_name === `${owner}/${repo}` &&
+                pr.head.ref.startsWith('codex/');
+              if (!trusted) continue;
+
+              try {
+                await github.rest.pulls.updateBranch({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  expected_head_sha: pr.head.sha,
+                });
+                core.info(`Requested update for PR #${pr.number}`);
+              } catch (error) {
+                if (error.status === 422) {
+                  core.notice(`PR #${pr.number} is current or needs conflict reconciliation.`);
+                  continue;
+                }
+                throw error;
+              }
+            }
