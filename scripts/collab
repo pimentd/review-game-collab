@@ -195,6 +195,63 @@ bootstrap() {
   say "Bootstrap version ${COLLAB_VERSION} is installed."
 }
 
+remote_protection_ok() {
+  local root slug id valid legacy
+  root="$(repo_root)"
+  slug="$(repo_slug "$root")"
+  id="$(gh api "repos/${slug}/rulesets" \
+    --jq '.[] | select(.name == "Protect main" and .enforcement == "active") | .id' \
+    2>/dev/null | head -n 1 || true)"
+  if [[ -n "$id" ]]; then
+    valid="$(gh api "repos/${slug}/rulesets/${id}" --jq '
+      (.enforcement == "active") and
+      (any(.rules[]; .type == "deletion")) and
+      (any(.rules[]; .type == "non_fast_forward")) and
+      (any(.rules[]; .type == "required_linear_history")) and
+      (any(.rules[]; .type == "pull_request" and (.parameters.allowed_merge_methods == ["squash"]))) and
+      (any(.rules[]; .type == "required_status_checks" and
+        .parameters.strict_required_status_checks_policy == true and
+        any(.parameters.required_status_checks[]; .context == "CI")))
+    ' 2>/dev/null || true)"
+    [[ "$valid" == "true" ]] && return 0
+  fi
+
+  legacy="$(gh api "repos/${slug}/branches/main/protection" --jq '
+    (.enforce_admins.enabled == true) and
+    (.allow_force_pushes.enabled == false) and
+    (.allow_deletions.enabled == false) and
+    (.required_linear_history.enabled == true) and
+    (.required_status_checks.strict == true) and
+    any(.required_status_checks.contexts[]; . == "CI")
+  ' 2>/dev/null || true)"
+  [[ "$legacy" == "true" ]]
+}
+
+configure_github() {
+  local root slug id
+  require_tools
+  root="$(repo_root)"
+  slug="$(repo_slug "$root")"
+  gh auth status -h github.com >/dev/null 2>&1 || die "GitHub CLI is not authenticated."
+  gh repo edit "$slug" --enable-auto-merge --delete-branch-on-merge \
+    --enable-squash-merge --enable-merge-commit=false --enable-rebase-merge=false
+  gh api --method PUT "repos/${slug}/actions/permissions/workflow" \
+    -f default_workflow_permissions=read -F can_approve_pull_request_reviews=false
+  id="$(gh api "repos/${slug}/rulesets" \
+    --jq '.[] | select(.name == "Protect main") | .id' 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$id" ]]; then
+    gh api --method PUT "repos/${slug}/rulesets/${id}" \
+      --input "$root/.github/main-ruleset.json" >/dev/null
+  else
+    if ! gh api --method POST "repos/${slug}/rulesets" \
+      --input "$root/.github/main-ruleset.json" >/dev/null; then
+      die "GitHub rejected private-repository protection. Upgrade to GitHub Pro or intentionally make the repository public, then rerun this command."
+    fi
+  fi
+  remote_protection_ok || die "GitHub ruleset was created but failed strict verification."
+  say "GitHub merge policy and strict main protection are active."
+}
+
 slugify() {
   printf '%s' "$*" | tr '[:upper:]' '[:lower:]' | \
     sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' | cut -c1-40
@@ -286,6 +343,8 @@ finish_task() {
       --body 'Implemented and verified by Codex using the repository collaboration workflow.')"
   fi
   say "Pull request: $pr_url"
+  remote_protection_ok || \
+    die "Refusing to merge without strict main protection. Upgrade to GitHub Pro or intentionally make the repository public, then run scripts/collab configure-github and retry."
   gh pr merge "$pr_url" --auto --squash --delete-branch
   gh pr checks "$pr_url" --watch --fail-fast
 
@@ -353,7 +412,7 @@ doctor() {
   value="$(gh repo view "$(repo_slug "$root")" --json allowAutoMerge,deleteBranchOnMerge,mergeCommitAllowed,rebaseMergeAllowed,squashMergeAllowed \
     --jq '[.allowAutoMerge,.deleteBranchOnMerge,(.mergeCommitAllowed|not),(.rebaseMergeAllowed|not),.squashMergeAllowed] | all' 2>/dev/null || true)"
   check test "$value" = true
-  check gh api "repos/$(repo_slug "$root")/rulesets" --jq 'any(.[]; .name == "Protect main" and .enforcement == "active")'
+  check remote_protection_ok
   show_recovery
   (( failures == 0 )) || die "$failures doctor check(s) failed."
   say "Doctor passed."
@@ -364,6 +423,7 @@ usage() {
 Usage: scripts/collab COMMAND [arguments]
 
   bootstrap              Configure this machine and safe background main sync
+  configure-github       Apply and verify safe GitHub merge/protection settings
   sync-main              Fetch and fast-forward a clean canonical main only
   start "description"    Create and immediately publish an isolated task worktree
   checkpoint [message]   Commit and push a recoverable task milestone
@@ -378,6 +438,7 @@ command="${1:-}"
 [[ $# -eq 0 ]] || shift
 case "$command" in
   bootstrap) bootstrap "$@" ;;
+  configure-github) configure_github "$@" ;;
   sync-main) sync_main "$@" ;;
   start) start_task "$@" ;;
   checkpoint) checkpoint "$@" ;;

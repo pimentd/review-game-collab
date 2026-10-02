@@ -53,4 +53,8 @@ if grep -R -nE '(reset --hard|push[^#]*--force|checkout -- (ours|theirs))' \
 fi
 pass "automation contains no destructive Git shortcuts"
 
+grep -q 'remote_protection_ok' "$source_root/scripts/collab" || \
+  fail "finish path lacks a remote-protection gate"
+pass "automatic merge is gated on verified remote protection"
+
 printf 'All collaboration tests passed.\n'

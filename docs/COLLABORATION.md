@@ -46,3 +46,12 @@ checkout is dirty or has diverged, it stops and records the condition for Codex.
 
 After that, neither person needs routine Git commands. Run `./scripts/collab doctor`
 only when diagnosing setup; Codex normally handles it.
+
+## GitHub plan requirement
+
+For a private repository, GitHub requires a plan that supports private-repository
+rulesets or branch protection. The automation deliberately refuses to merge when
+protection is absent. After enabling GitHub Pro (or intentionally making the
+repository public), Codex runs `./scripts/collab configure-github` once; that
+activates the checked-in strict ruleset and verifies it instead of weakening the
+workflow.
