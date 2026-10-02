@@ -142,7 +142,14 @@ PLIST
   launchctl bootout "gui/${uid}/${COLLAB_LABEL}" >/dev/null 2>&1 || true
   mv "$tmp" "$plist"
   launchctl bootstrap "gui/${uid}" "$plist"
+  launchctl kickstart -k "gui/${uid}/${COLLAB_LABEL}"
   say "Installed macOS LaunchAgent ${COLLAB_LABEL}."
+}
+
+launchd_agent_healthy() {
+  local details
+  details="$(launchctl print "gui/$(id -u)/${COLLAB_LABEL}" 2>/dev/null)" || return 1
+  grep -Eq 'state = running|last exit code = 0' <<<"$details"
 }
 
 install_linux_timer() {
@@ -404,13 +411,14 @@ doctor() {
   check test "$(cat "$dir/bootstrap-version" 2>/dev/null || true)" = "$COLLAB_VERSION"
   if [[ "$(uname -s)" == "Darwin" ]]; then
     check test -f "${HOME}/Library/LaunchAgents/${COLLAB_LABEL}.plist"
-    check launchctl print "gui/$(id -u)/${COLLAB_LABEL}"
+    check launchd_agent_healthy
   elif [[ "$(uname -s)" == "Linux" ]]; then
     check systemctl --user is-enabled review-game-collab-sync.timer
     check systemctl --user is-active review-game-collab-sync.timer
   fi
-  value="$(gh repo view "$(repo_slug "$root")" --json allowAutoMerge,deleteBranchOnMerge,mergeCommitAllowed,rebaseMergeAllowed,squashMergeAllowed \
-    --jq '[.allowAutoMerge,.deleteBranchOnMerge,(.mergeCommitAllowed|not),(.rebaseMergeAllowed|not),.squashMergeAllowed] | all' 2>/dev/null || true)"
+  value="$(gh api "repos/$(repo_slug "$root")" --jq \
+    '[.allow_auto_merge,.delete_branch_on_merge,(.allow_merge_commit|not),(.allow_rebase_merge|not),.allow_squash_merge] | all' \
+    2>/dev/null || true)"
   check test "$value" = true
   check remote_protection_ok
   show_recovery
