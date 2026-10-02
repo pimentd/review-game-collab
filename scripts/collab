@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly COLLAB_VERSION="1"
+readonly COLLAB_LABEL="com.review-game-collab.sync-main"
+
+say() { printf '[collab] %s\n' "$*"; }
+warn() { printf '[collab] WARNING: %s\n' "$*" >&2; }
+die() { printf '[collab] ERROR: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || die "Run this command inside the repository."
+}
+
+repo_slug() {
+  local url
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)" || die "origin is not configured."
+  url="${url%.git}"
+  printf '%s\n' "${url##*:}" | sed 's#^//##; s#^[^/]*/##'
+}
+
+state_dir() {
+  local root slug base
+  root="$(repo_root)"
+  slug="$(repo_slug "$root" | tr '/' '-')"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    base="${HOME}/Library/Application Support"
+  else
+    base="${XDG_STATE_HOME:-${HOME}/.local/state}"
+  fi
+  printf '%s/%s\n' "$base" "$slug"
+}
+
+record_status() {
+  local dir
+  dir="$(state_dir)"
+  mkdir -p "$dir"
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >"$dir/last-sync-status"
+}
+
+require_tools() {
+  local tool
+  for tool in git gh; do
+    have "$tool" || die "$tool is required."
+  done
+}
+
+canonical_root() {
+  local common line path branch
+  common="$(git rev-parse --git-common-dir)"
+  common="$(cd "$common" && pwd -P)"
+  path=""
+  branch=""
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) path="${line#worktree }" ;;
+      branch\ refs/heads/main) branch="main" ;;
+      '')
+        if [[ "$branch" == "main" ]]; then printf '%s\n' "$path"; return 0; fi
+        path=""; branch=""
+        ;;
+    esac
+  done < <(git --git-dir="$common" worktree list --porcelain; printf '\n')
+  die "No canonical worktree has local branch main checked out."
+}
+
+show_recovery() {
+  local root user output
+  root="$(repo_root)"
+  gh auth status -h github.com >/dev/null 2>&1 || return 0
+  user="$(gh api user --jq .login 2>/dev/null)" || return 0
+  output="$(gh -R "$(repo_slug "$root")" pr list --state open --base main \
+    --search "head:codex/${user}/" \
+    --json number,title,headRefName,url \
+    --jq '.[] | "  #\(.number) \(.headRefName) — \(.title) (\(.url))"' 2>/dev/null || true)"
+  if [[ -n "$output" ]]; then
+    say "Recoverable open tasks for ${user}:"
+    printf '%s\n' "$output"
+  fi
+}
+
+sync_main() {
+  local root before after
+  root="$(canonical_root)"
+  if [[ "$(git -C "$root" branch --show-current)" != "main" ]]; then
+    record_status "blocked: canonical checkout is not on main"
+    die "Canonical checkout is not on main: $root"
+  fi
+  if [[ -n "$(git -C "$root" status --porcelain)" ]]; then
+    record_status "blocked: canonical main is dirty"
+    die "Canonical main is dirty; left untouched for Codex to reconcile: $root"
+  fi
+
+  before="$(git -C "$root" rev-parse HEAD)"
+  if ! git -C "$root" fetch --prune origin; then
+    record_status "temporary failure: fetch failed"
+    die "Fetch failed; no local state was changed."
+  fi
+  git -C "$root" show-ref --verify --quiet refs/remotes/origin/main || \
+    die "origin/main does not exist."
+  git -C "$root" merge-base --is-ancestor HEAD origin/main || {
+    record_status "blocked: local main diverged from origin/main"
+    die "Local main diverged from origin/main; refusing to reset or overwrite it."
+  }
+  git -C "$root" merge --ff-only origin/main
+  git -C "$root" worktree prune --expire now
+  after="$(git -C "$root" rev-parse HEAD)"
+  record_status "ok: main ${before} -> ${after}"
+  say "Canonical main is current at ${after}."
+}
+
+install_macos_agent() {
+  local root agent_dir log_dir plist tmp uid
+  root="$(canonical_root)"
+  agent_dir="${HOME}/Library/LaunchAgents"
+  log_dir="${HOME}/Library/Logs/review-game-collab"
+  plist="$agent_dir/${COLLAB_LABEL}.plist"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/${COLLAB_LABEL}.XXXXXX")"
+  mkdir -p "$agent_dir" "$log_dir"
+  cat >"$tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${COLLAB_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${root}/scripts/collab</string>
+    <string>sync-main</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>${log_dir}/sync.log</string>
+  <key>StandardErrorPath</key><string>${log_dir}/sync-error.log</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint "$tmp" >/dev/null
+  uid="$(id -u)"
+  launchctl bootout "gui/${uid}/${COLLAB_LABEL}" >/dev/null 2>&1 || true
+  mv "$tmp" "$plist"
+  launchctl bootstrap "gui/${uid}" "$plist"
+  say "Installed macOS LaunchAgent ${COLLAB_LABEL}."
+}
+
+install_linux_timer() {
+  local root unit_dir
+  root="$(canonical_root)"
+  unit_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+  mkdir -p "$unit_dir"
+  cat >"$unit_dir/review-game-collab-sync.service" <<UNIT
+[Unit]
+Description=Safely fast-forward Review Game Collab main
+
+[Service]
+Type=oneshot
+ExecStart=${root}/scripts/collab sync-main
+UNIT
+  cat >"$unit_dir/review-game-collab-sync.timer" <<UNIT
+[Unit]
+Description=Periodically synchronize Review Game Collab main
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now review-game-collab-sync.timer
+  say "Installed Linux systemd user timer."
+}
+
+bootstrap() {
+  local root dir
+  require_tools
+  root="$(canonical_root)"
+  gh auth status -h github.com >/dev/null 2>&1 || \
+    die "GitHub CLI is not authenticated; run gh auth login, then retry."
+  git -C "$root" config fetch.prune true
+  git -C "$root" config pull.ff only
+  sync_main
+  case "$(uname -s)" in
+    Darwin) install_macos_agent ;;
+    Linux) install_linux_timer ;;
+    *) warn "No automatic scheduler installer is available for $(uname -s)." ;;
+  esac
+  dir="$(state_dir)"
+  mkdir -p "$dir"
+  printf '%s\n' "$COLLAB_VERSION" >"$dir/bootstrap-version"
+  say "Bootstrap version ${COLLAB_VERSION} is installed."
+}
+
+slugify() {
+  printf '%s' "$*" | tr '[:upper:]' '[:lower:]' | \
+    sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' | cut -c1-40
+}
+
+start_task() {
+  local root canonical description slug user stamp branch parent path
+  require_tools
+  [[ $# -gt 0 ]] || die 'Usage: scripts/collab start "task description"'
+  root="$(repo_root)"
+  canonical="$(canonical_root)"
+  sync_main
+  show_recovery
+  description="$*"
+  slug="$(slugify "$description")"
+  [[ -n "$slug" ]] || slug="task"
+  user="$(gh api user --jq .login)"
+  stamp="$(date -u +%Y%m%d%H%M%S)-$$"
+  branch="codex/${user}/${slug}-${stamp}"
+  parent="$(dirname "$canonical")/$(basename "$canonical")-worktrees"
+  path="$parent/${slug}-${stamp}"
+  mkdir -p "$parent"
+  git -C "$canonical" worktree add -b "$branch" "$path" origin/main
+  git -C "$path" push -u origin "$branch"
+  say "Published $branch immediately."
+  say "Worktree: $path"
+}
+
+secret_guard() {
+  local root bad
+  root="$(repo_root)"
+  bad="$(git -C "$root" ls-files --cached --others --exclude-standard | \
+    grep -E '(^|/)(\.env($|\.)|id_(rsa|dsa|ecdsa|ed25519)$|.*\.(pem|p12|pfx|key)$)' || true)"
+  [[ -z "$bad" ]] || die "Refusing to checkpoint possible secret files:\n$bad"
+}
+
+checkpoint() {
+  local root branch message
+  root="$(repo_root)"
+  branch="$(git -C "$root" branch --show-current)"
+  [[ "$branch" == codex/* ]] || die "Checkpoint only runs on a codex/** task branch, not $branch."
+  message="${*:-recoverable work checkpoint}"
+  secret_guard
+  git -C "$root" add -A
+  if ! git -C "$root" diff --cached --quiet; then
+    git -C "$root" commit -m "checkpoint: $message"
+  else
+    say "No file changes to commit."
+  fi
+  git -C "$root" push -u origin "$branch"
+  say "Checkpoint is recoverable on origin/$branch."
+}
+
+project_checks() {
+  local root
+  root="$(repo_root)"
+  bash -n "$root/scripts/collab" "$root/scripts/test-collab.sh"
+  "$root/scripts/test-collab.sh"
+  if [[ -f "$root/package-lock.json" ]]; then
+    have npm || die "npm is required by package-lock.json."
+    (cd "$root" && npm ci --ignore-scripts && npm run check)
+  elif [[ -f "$root/package.json" ]]; then
+    die "package.json exists without package-lock.json; add a lockfile before CI."
+  fi
+}
+
+finish_task() {
+  local root branch slug pr_url state count
+  root="$(repo_root)"
+  branch="$(git -C "$root" branch --show-current)"
+  [[ "$branch" == codex/* ]] || die "Finish only runs on a codex/** task branch."
+  [[ -z "$(git -C "$root" status --porcelain)" ]] || checkpoint "pre-integration checkpoint"
+
+  git -C "$root" fetch --prune origin
+  if ! git -C "$root" merge-base --is-ancestor origin/main HEAD; then
+    say "Incorporating the newest origin/main without rewriting published history."
+    if ! git -C "$root" merge --no-edit origin/main; then
+      die "Merge conflict needs semantic reconciliation in $root; no side was discarded."
+    fi
+  fi
+  project_checks
+  git -C "$root" push origin "$branch"
+
+  pr_url="$(gh pr view "$branch" --json url --jq .url 2>/dev/null || true)"
+  if [[ -z "$pr_url" ]]; then
+    slug="${branch##*/}"
+    pr_url="$(gh pr create --base main --head "$branch" \
+      --title "${slug//-/ }" \
+      --body 'Implemented and verified by Codex using the repository collaboration workflow.')"
+  fi
+  say "Pull request: $pr_url"
+  gh pr merge "$pr_url" --auto --squash --delete-branch
+  gh pr checks "$pr_url" --watch --fail-fast
+
+  count=0
+  while (( count < 20 )); do
+    state="$(gh pr view "$pr_url" --json state --jq .state)"
+    [[ "$state" == "MERGED" ]] && break
+    [[ "$state" == "CLOSED" ]] && die "Pull request closed without merging."
+    sleep 15
+    count=$((count + 1))
+  done
+  [[ "$state" == "MERGED" ]] || die "Checks passed but merge is still pending; inspect $pr_url."
+  sync_main
+  say "Merged safely. Run cleanup from canonical main when this worktree is no longer in use."
+}
+
+cleanup_merged() {
+  local root current branch path pr_state
+  root="$(canonical_root)"
+  current="$(pwd -P)"
+  while IFS=$'\t' read -r branch path; do
+    [[ -n "$branch" && "$branch" == codex/* ]] || continue
+    [[ "$path" != "$current" ]] || { warn "Skipping current worktree $path"; continue; }
+    [[ -z "$(git -C "$path" status --porcelain 2>/dev/null || printf dirty)" ]] || {
+      warn "Skipping dirty worktree $path"; continue;
+    }
+    pr_state="$(gh pr list --state merged --head "$branch" --json state --jq '.[0].state // ""' 2>/dev/null || true)"
+    [[ "$pr_state" == "MERGED" ]] || { warn "Keeping unmerged branch $branch"; continue; }
+    git -C "$root" worktree remove "$path"
+    git -C "$root" branch -D "$branch"
+    say "Removed merged task worktree and local branch $branch."
+  done < <(git -C "$root" worktree list --porcelain | awk '
+    /^worktree / { path=substr($0,10) }
+    /^branch refs\/heads\/codex\// { branch=substr($0,19); print branch "\t" path }
+  ')
+  git -C "$root" fetch --prune origin
+  git -C "$root" worktree prune --expire now
+}
+
+doctor() {
+  local root dir failures value
+  require_tools
+  root="$(canonical_root)"
+  failures=0
+  check() {
+    if "$@"; then printf 'PASS  %s\n' "$*"; else printf 'FAIL  %s\n' "$*"; failures=$((failures + 1)); fi
+  }
+  check test "$(git -C "$root" branch --show-current)" = main
+  check test -z "$(git -C "$root" status --porcelain)"
+  check git -C "$root" diff --quiet origin/main...main
+  check gh auth status -h github.com
+  check test -x "$root/scripts/collab"
+  check test -f "$root/.github/workflows/ci.yml"
+  check test "$(git -C "$root" config --get fetch.prune)" = true
+  check test "$(git -C "$root" config --get pull.ff)" = only
+  dir="$(state_dir)"
+  check test "$(cat "$dir/bootstrap-version" 2>/dev/null || true)" = "$COLLAB_VERSION"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    check test -f "${HOME}/Library/LaunchAgents/${COLLAB_LABEL}.plist"
+    check launchctl print "gui/$(id -u)/${COLLAB_LABEL}"
+  elif [[ "$(uname -s)" == "Linux" ]]; then
+    check systemctl --user is-enabled review-game-collab-sync.timer
+    check systemctl --user is-active review-game-collab-sync.timer
+  fi
+  value="$(gh repo view "$(repo_slug "$root")" --json allowAutoMerge,deleteBranchOnMerge,mergeCommitAllowed,rebaseMergeAllowed,squashMergeAllowed \
+    --jq '[.allowAutoMerge,.deleteBranchOnMerge,(.mergeCommitAllowed|not),(.rebaseMergeAllowed|not),.squashMergeAllowed] | all' 2>/dev/null || true)"
+  check test "$value" = true
+  check gh api "repos/$(repo_slug "$root")/rulesets" --jq 'any(.[]; .name == "Protect main" and .enforcement == "active")'
+  show_recovery
+  (( failures == 0 )) || die "$failures doctor check(s) failed."
+  say "Doctor passed."
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/collab COMMAND [arguments]
+
+  bootstrap              Configure this machine and safe background main sync
+  sync-main              Fetch and fast-forward a clean canonical main only
+  start "description"    Create and immediately publish an isolated task worktree
+  checkpoint [message]   Commit and push a recoverable task milestone
+  finish                 Update, verify, PR, auto-merge, and refresh canonical main
+  cleanup                Remove only clean worktrees whose PRs are already merged
+  doctor                 Verify local and GitHub collaboration configuration
+  ci                     Run the repository's deterministic verification surface
+USAGE
+}
+
+command="${1:-}"
+[[ $# -eq 0 ]] || shift
+case "$command" in
+  bootstrap) bootstrap "$@" ;;
+  sync-main) sync_main "$@" ;;
+  start) start_task "$@" ;;
+  checkpoint) checkpoint "$@" ;;
+  finish) finish_task "$@" ;;
+  cleanup) cleanup_merged "$@" ;;
+  doctor) doctor "$@" ;;
+  ci) project_checks "$@" ;;
+  help|-h|--help|'') usage ;;
+  *) usage >&2; die "Unknown command: $command" ;;
+esac
