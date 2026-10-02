@@ -407,30 +407,33 @@ doctor() {
   root="$(canonical_root)"
   failures=0
   check() {
-    if "$@"; then printf 'PASS  %s\n' "$*"; else printf 'FAIL  %s\n' "$*"; failures=$((failures + 1)); fi
+    local label
+    label="$1"
+    shift
+    if "$@"; then printf 'PASS  %s\n' "$label"; else printf 'FAIL  %s\n' "$label"; failures=$((failures + 1)); fi
   }
-  check test "$(git -C "$root" branch --show-current)" = main
-  check test -z "$(git -C "$root" status --porcelain)"
-  check git -C "$root" diff --quiet origin/main...main
-  check gh auth status -h github.com
-  check test -x "$root/scripts/collab"
-  check test -f "$root/.github/workflows/ci.yml"
-  check test "$(git -C "$root" config --get fetch.prune)" = true
-  check test "$(git -C "$root" config --get pull.ff)" = only
+  check "canonical checkout is on main" test "$(git -C "$root" branch --show-current)" = main
+  check "canonical main is clean" test -z "$(git -C "$root" status --porcelain)"
+  check "canonical main matches origin/main" git -C "$root" diff --quiet origin/main...main
+  check "GitHub CLI authentication" gh auth status -h github.com
+  check "collaboration command is executable" test -x "$root/scripts/collab"
+  check "CI workflow exists" test -f "$root/.github/workflows/ci.yml"
+  check "automatic remote pruning is configured" test "$(git -C "$root" config --get fetch.prune)" = true
+  check "pulls are fast-forward only" test "$(git -C "$root" config --get pull.ff)" = only
   dir="$(state_dir)"
-  check test "$(cat "$dir/bootstrap-version" 2>/dev/null || true)" = "$COLLAB_VERSION"
+  check "local bootstrap version is current" test "$(cat "$dir/bootstrap-version" 2>/dev/null || true)" = "$COLLAB_VERSION"
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    check test -f "${HOME}/Library/LaunchAgents/${COLLAB_LABEL}.plist"
-    check launchd_agent_healthy
+    check "macOS LaunchAgent is installed" test -f "${HOME}/Library/LaunchAgents/${COLLAB_LABEL}.plist"
+    check "macOS LaunchAgent last run succeeded" launchd_agent_healthy
   elif [[ "$(uname -s)" == "Linux" ]]; then
-    check systemctl --user is-enabled review-game-collab-sync.timer
-    check systemctl --user is-active review-game-collab-sync.timer
+    check "systemd sync timer is enabled" systemctl --user is-enabled review-game-collab-sync.timer
+    check "systemd sync timer is active" systemctl --user is-active review-game-collab-sync.timer
   fi
   value="$(gh api "repos/$(repo_slug "$root")" --jq \
     '[.allow_auto_merge,.delete_branch_on_merge,(.allow_merge_commit|not),(.allow_rebase_merge|not),.allow_squash_merge] | all' \
     2>/dev/null || true)"
-  check test "$value" = true
-  check remote_protection_ok
+  check "GitHub auto-merge, branch cleanup, and squash-only policy" test "$value" = true
+  check "strict GitHub main protection is active" remote_protection_ok
   show_recovery
   (( failures == 0 )) || die "$failures doctor check(s) failed."
   say "Doctor passed."
