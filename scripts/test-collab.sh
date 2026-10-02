@@ -47,6 +47,9 @@ rm "$tmp_root/canonical/unknown.txt"
   fail "clean canonical main did not fast-forward"
 pass "clean canonical main fast-forwards"
 
+(cd / && HOME="$tmp_root/home" "$tmp_root/canonical/scripts/collab" sync-main) >/dev/null
+pass "background sync discovers its repository without a working directory"
+
 if grep -R -nE '(reset --hard|push[^#]*--force|checkout -- (ours|theirs))' \
   "$source_root/scripts/collab" "$source_root/.github" >/dev/null; then
   fail "destructive Git operation found in collaboration automation"

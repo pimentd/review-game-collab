@@ -10,7 +10,15 @@ die() { printf '[collab] ERROR: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 repo_root() {
-  git rev-parse --show-toplevel 2>/dev/null || die "Run this command inside the repository."
+  local discovered script_root
+  discovered="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$discovered" ]]; then
+    printf '%s\n' "$discovered"
+    return 0
+  fi
+  script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  git -C "$script_root" rev-parse --show-toplevel 2>/dev/null || \
+    die "Run this command inside the repository."
 }
 
 repo_slug() {
@@ -47,8 +55,10 @@ require_tools() {
 }
 
 canonical_root() {
-  local common line path branch
-  common="$(git rev-parse --git-common-dir)"
+  local root common line path branch
+  root="$(repo_root)"
+  common="$(git -C "$root" rev-parse --git-common-dir)"
+  [[ "$common" == /* ]] || common="$root/$common"
   common="$(cd "$common" && pwd -P)"
   path=""
   branch=""
